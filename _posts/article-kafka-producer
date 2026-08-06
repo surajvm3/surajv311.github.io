@@ -1,0 +1,145 @@
+Kafka Producer Knobs:
+
+This is a rundown of the producer settings that actually matter, what they're trading off, and the failure modes they're protecting against.
+
+The buffer: max.buffered.records (or buffer.memory in the Java client)
+
+The producer keeps an in-memory queue of records waiting to be sent. This setting controls how large that queue can get.
+
+The reason this exists: your application produces records at whatever rate it produces them. Kafka brokers receive records at whatever rate they can handle. These two rates are almost never the same. The buffer absorbs the difference — your application keeps running while the producer drains the queue in the background.
+
+What happens when the buffer fills up is the interesting part, and it's a deliberate choice with real consequences:
+
+Block the caller until space frees up. This backpressures the producing side, which is fine if you can afford to slow down. Not fine if you're in an HTTP request handler.
+Drop the record immediately and return an error. This is "fire and forget with a hard cap." You lose data but you never slow down the caller.
+
+Neither is wrong. They're for different situations. A background analytics event pipeline can usually afford to block. A real-time write path that's mirroring data to Kafka as a secondary concern should probably drop and log rather than hold up the primary operation.
+
+Setting this too low means any brief Kafka hiccup (broker GC pause, rolling restart) fills the buffer and you start dropping or blocking. Setting it too high means your process can silently accumulate gigabytes of undelivered records before you notice Kafka is unreachable.
+
+A reasonable starting point is something that covers 30–60 seconds of your peak throughput.
+
+Two different timeouts that people constantly confuse
+request.timeout.ms — one network round trip
+
+This is the deadline for a single Kafka protocol request. When the producer sends a batch to a broker, it waits up to this long for an acknowledgment. If the broker doesn't respond in time, the request fails and the producer retries.
+
+This is a per-attempt timeout, not a total timeout.
+
+Set this too short and you'll get spurious timeouts during normal broker behavior: GC pauses, leader elections, slow replication. The producer retries, which increases load, which can make things worse. Under 1 second is almost always wrong for production.
+
+delivery.timeout.ms — total record lifetime
+
+This is how long a record can live in the producer before it's permanently abandoned. The producer will keep retrying failed requests (each one bounded by request.timeout.ms) until delivery.timeout.ms expires, at which point the record is dropped and the callback fires with an error.
+
+These two work together. With request.timeout.ms=5s and delivery.timeout.ms=5m, a record can survive up to five minutes of Kafka being completely unreachable, with the producer attempting a new request every 5 seconds or so. After 5 minutes, it gives up.
+
+The minimum for delivery.timeout.ms worth thinking about: Kafka rolling restarts typically take 10–20 seconds per broker. If your delivery timeout is shorter than a rolling restart, you'll drop records during routine maintenance. 30–60 seconds is a reasonable floor.
+
+The practical maximum is driven by memory. Records sitting in the buffer waiting for delivery are bytes sitting in your heap. At high throughput, "records that will never be delivered" filling up memory is a real OOM path.
+
+linger.ms — batching delay
+
+The producer waits up to this many milliseconds before sending a batch, collecting more records in the meantime. More records per batch means better compression ratios and fewer network round trips.
+
+The tension: linger adds latency. For a 200ms linger, the first record in a batch might wait up to 200ms before it goes out. For most async/background producers this is fine. For anything latency-sensitive it might not be.
+
+One thing worth knowing: linger time counts against a record's delivery.timeout.ms. A record that waits 200ms in a linger window has 200ms less of its delivery timeout remaining. At normal settings this is insignificant. But if you're tuning a very short delivery timeout (say, 30s), a 200ms linger is a small but real reduction in your retry budget.
+
+At low throughput — under a few hundred records per second per partition — linger is mostly useful because batches would otherwise contain a single record and you'd compress nothing. At high throughput, batches fill naturally before the linger window expires and the setting barely matters.
+
+acks — who needs to confirm before the broker says "done"
+
+acks=0: Don't wait for confirmation at all. Maximum throughput, zero durability guarantees.
+
+acks=1: The partition leader confirms it wrote the record. If the leader crashes before replicating, the record is gone.
+
+acks=all (or acks=-1): Every in-sync replica confirms the write. The broker only acknowledges after the record is safe on all replicas. If the leader crashes immediately after acknowledging, any in-sync follower can take over without data loss.
+
+For any use case where losing records is genuinely unacceptable, acks=all is the only real option. The throughput hit is real but usually smaller than people expect — the acknowledgment from replicas happens in parallel, and the latency is dominated by network round trips to the broker, not replication.
+
+acks=all is also required for idempotent writes. Which brings us to:
+
+Idempotent producer (enable.idempotence=true)
+
+When the producer sends a batch and doesn't get an acknowledgment in time, it retries. Without idempotence, if the first send actually succeeded (the ack just got lost in transit), the retry causes a duplicate. With idempotence, the broker detects the retry using a sequence number and discards it.
+
+This is particularly important if you have retry logic at the application level too. Without idempotence, a network blip can cause records to appear twice in Kafka even if you haven't written any retry logic yourself.
+
+Idempotence requires acks=all and max.in.flight.requests.per.connection ≤ 5. In most clients it's enabled automatically when acks=all is set, or there's a single flag to turn on both.
+
+If you need exactly-once delivery end-to-end (not just no duplicates from retries, but no duplicates when your consumer processes records), you need Kafka transactions — a much heavier mechanism. Idempotent producer + acks=all gets you "at least once with deduplication at the broker." Transactions get you "exactly once across produce and consume."
+
+Compression
+
+Line-protocol telemetry, JSON events, log lines — almost all Kafka payloads are highly compressible text with repetitive field names.
+
+The contenders:
+
+gzip: Highest compression ratio, highest CPU cost. Was the standard choice for years.
+snappy: Lower compression ratio, very low CPU cost. Good when CPU is the bottleneck.
+lz4: Faster than gzip at similar compression ratios. Good middle ground.
+zstd: Often beats gzip on compression ratio with less CPU than gzip. The current recommended default for most use cases.
+
+For repetitive telemetry data (same field names, same measurement names, lots of numerical values), zstd compression ratios of 10–20x are common. At those ratios you're sending a tenth of the bytes across the wire, which matters a lot if Kafka is on a different network segment or cross-region.
+
+One broker-side setting to check: compression.type on the topic. If it's set to something specific (say, gzip), the broker will recompress your zstd batches. Set it to producer and the broker stores batches exactly as received without touching them.
+
+Partition key — nil vs something meaningful
+
+The record key controls which partition a record lands in. Records with the same key always go to the same partition (within a topic's current partition count). Records with a nil/null key are typically distributed evenly across partitions by the client.
+
+Keying by something like a tenant ID or entity ID gives ordering guarantees: all records for the same tenant are in the same partition, so a consumer sees them in order. It also means that tenant's write rate determines that partition's load. If one tenant writes 100x more than others, one partition gets 100x the traffic. This is the hot partition problem.
+
+Keying by nil (round-robin or random) spreads load evenly but you lose ordering guarantees across partitions.
+
+A middle ground: use a key that's more granular than "one per tenant" — something like tenant_id + metric_type — so load spreads across multiple partitions while still giving you ordering within a category.
+
+If you need tenant identity preserved for consumers but don't want it to affect partitioning, put it in a record header instead of the key.
+
+Partition count and the partition reconciliation problem
+
+Topics need to exist with enough partitions before you start producing. The two decisions you make at topic creation:
+
+Partition count: More partitions = more parallelism for consumers. But partitions are the unit of Kafka's replication overhead. 100 partitions with 3 replicas = 300 replica "slots" the cluster manages. Very high partition counts cause real cluster overhead. A good starting heuristic: partition count ≈ your target consumer parallelism. If you want 10 consumer threads processing a topic, 10–20 partitions is reasonable.
+
+Replication factor: Typically 3 for production. With min.insync.replicas=2 and acks=all, you can lose one broker and keep writing.
+
+Kafka can add partitions to an existing topic. It cannot remove them. This asymmetry matters if you're auto-creating topics programmatically: if your code creates a topic with 3 partitions, then configuration changes to want 10, you can reconcile up. If it changes to want 2, you're stuck at 3. Worth guarding against a config service returning a nonsense value (like 50,000 partitions) with a hard cap in whatever creates topics.
+
+Shutdown: flush before close
+
+When your process shuts down, there are probably records in the buffer that haven't been sent yet. If you just call close(), what happens to them depends on the client.
+
+The correct pattern:
+
+Stop accepting new records.
+Call flush() with a reasonable timeout — give in-flight records a chance to drain.
+Call close().
+
+Without the flush, records sitting in the linger window or waiting in the buffer just get dropped. With it, a clean shutdown loses nothing. The timeout on flush() matters: set it too short and you're back to dropping. Set it too long and your deployment pipeline stalls. Something in the range of your delivery.timeout.ms / 6 is reasonable — enough to get through one or two broker retry cycles.
+
+Monitoring what actually matters
+
+The metrics that tell you something useful:
+
+Record send rate vs record error rate — errors here mean records that couldn't be delivered within delivery.timeout.ms. Baseline should be zero. Any uptick is worth investigating immediately.
+
+Producer request latency — how long round trips to the broker are taking. A sudden increase tells you about broker-side problems before they cascade to delivery.timeout.ms expirations.
+
+Buffer utilization — how full the record buffer is as a fraction of its max. Under 50% at peak load is comfortable. Consistently above 80% means you're close to starting to drop or block.
+
+Batch size distribution — if your average batch size is 1 record, compression is doing nothing for you and you're wasting round trips. Either increase linger or accept that your throughput is just low and that's fine.
+
+Compression ratio — most clients expose this. For text telemetry, under 3x compression is a signal that something's wrong with how records are being batched.
+
+The one thing that surprises most people
+
+When you call close() on a producer client, many client libraries do not wait for all pending callbacks to finish before returning. The client is closed, but the callback goroutines/threads are still running and will try to touch your producer's metrics or state after the object is being torn down.
+
+This is a real race condition and a real source of crashes in high-throughput producers during shutdown. The fix is to track in-flight callbacks with a wait group (or equivalent), increment before each produce, decrement in the callback, and wait for the count to hit zero before returning from your close method.
+
+It's unglamorous but it matters.
+
+The big takeaway: most of these knobs are not independent. delivery.timeout.ms only makes sense relative to request.timeout.ms. Linger interacts with delivery timeout. Buffer size is meaningless without knowing your throughput. Tune them as a set, not one at a time.
+
