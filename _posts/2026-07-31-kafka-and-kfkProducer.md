@@ -1,16 +1,18 @@
-# Kafka Deep Dive: Architecture, Producer Configs, and Exactly-Once Semantics
-
-> A practical deep dive into how Kafka works — from core primitives to multi-broker replication, producer durability configs, and exactly-once guarantees — grounded in a real-world GKE + Strimzi cluster running on Spot instances.
-
+---
+layout: post 
+title: Kafka Producer Knobs 
+category: technicalArticles
 ---
 
-## The Cluster We're Working With
+> From my experience working at [GreyOrange](https://www.greyorange.com/). Refactored my article a bit with help of GPT. 
 
-Before diving into theory, here's the real-world setup this article is grounded in:
+I was working on a service with a senior engineer that would produce events to Kafka. The entire pipeline from service to kafka to downstream consumers had to be exactly once, hence as part of work, I came across interesting producer configs, which I will discuss. 
+
+Although before that, a quick brush up of Kafka. I am assuming below Kafka configs, based on which I will discuss few things, pretty similar to a setup I was working on: 
 
 | Config | Value |
 |---|---|
-| **Kafka version** | 4.3.1 (KRaft mode — no ZooKeeper) |
+| **Kafka version** | 4.3.x (KRaft mode — no ZooKeeper) |
 | **Brokers** | 3 |
 | **Instance type** | Spot VMs, 1 broker per zone (3 zones) |
 | **Replication factor** | 2 |
@@ -22,26 +24,12 @@ Before diving into theory, here's the real-world setup this article is grounded 
 
 Three brokers, each pinned to a different GCP zone. Every partition has one leader and one follower — almost certainly in different zones.
 
----
-
-## Part 1 — What Is Kafka, Really?
-
-Think of Kafka as a **durable, ordered, high-throughput log on a network**. You write messages into it (produce), and other systems read from it (consume) at their own pace.
-
-Unlike a message queue — where a message disappears after one consumer reads it — Kafka *keeps* the message for a configurable retention window. Multiple consumers can read the same message independently.
-
-### The Core Primitives
-
-**Topic**
-
-A named stream of messages. Think of it like a table name or a named channel. Example: `robot.telemetry.battery`.
-
-**Partition**
-
-A topic is split into N ordered sub-logs called partitions. Each partition is an append-only file on disk. Messages within one partition are strictly ordered; across partitions, there is no ordering guarantee.
+- Kafka is a **durable, ordered, high-throughput log on a network**. You write messages into it (produce), and other systems read from it (consume) at their own pace. Unlike a message queue — where a message disappears after one consumer reads it — Kafka *keeps* the message for a configurable retention window. Multiple consumers can read the same message independently.
+- **Topic**: A named stream of messages. Think of it like a table name or a named channel. Example: `warehouse.rack.size`.
+- **Partition**: A topic is split into N ordered sub-logs called partitions. Each partition is an append-only file on disk. Messages within one partition are strictly ordered; across partitions, there is no ordering guarantee.
 
 ```
-Topic: robot.telemetry.battery  (4 partitions)
+Topic: warehouse.rack.size  (4 partitions)
 
 Partition 0:  [msg1] [msg5] [msg9]  [msg13] ──► (append-only)
 Partition 1:  [msg2] [msg6] [msg10] ──►
@@ -49,21 +37,10 @@ Partition 2:  [msg3] [msg7] [msg11] ──►
 Partition 3:  [msg4] [msg8] [msg12] ──►
 ```
 
-**Offset**
-
-Every message in a partition has a monotonically increasing integer ID called an offset — like an array index. A consumer remembers "I've read up to offset 42 in partition 2" and picks up from there on restart.
-
-**Broker**
-
-A single Kafka server process. It stores partitions on disk, accepts produce requests, and serves fetch requests to consumers. In a cluster, each broker owns a subset of partitions.
-
-**Producer**
-
-Any process that writes messages to Kafka.
-
-**Consumer Group**
-
-A set of processes that together read a topic. Kafka assigns each partition to exactly one consumer in the group at a time — so the group reads every message exactly once as a whole, with individual consumers each handling a subset of partitions.
+- **Offset**: Every message in a partition has a monotonically increasing integer ID called an offset — like an array index. A consumer remembers "I've read up to offset 42 in partition 2" and picks up from there on restart.
+- **Broker**: A single Kafka server process. It stores partitions on disk, accepts produce requests, and serves fetch requests to consumers. In a cluster, each broker owns a subset of partitions.
+- **Producer**: Any process that writes messages to Kafka.
+- **Consumer Group**: A set of processes that together read a topic. Kafka assigns each partition to exactly one consumer in the group at a time so the group reads every message exactly once as a whole, with individual consumers each handling a subset of partitions.
 
 ```
 Consumer Group "analytics" reading topic with 4 partitions
@@ -79,13 +56,9 @@ Consumer Group "analytics" reading topic with 4 partitions
 
 ---
 
-## Part 2 — Multi-Broker Cluster Architecture
+- Multi-Broker Cluster Architecture: A single broker is a single point of failure and a throughput ceiling. In production you run a cluster. Three reasons: fault tolerance, throughput, and storage capacity.
 
-A single broker is a single point of failure and a throughput ceiling. In production you run a cluster. Three reasons: **fault tolerance**, **throughput**, and **storage capacity**.
-
-### Replication: How Data Survives Broker Failures
-
-Every partition has one **leader** and zero-or-more **followers** (replicas). All produce and consume traffic goes to the leader. Followers pull from the leader to stay caught up.
+- Every partition has one **leader** and zero-or-more **followers** (replicas). All produce and consume traffic goes to the leader. Followers pull from the leader to stay caught up called replication. 
 
 ```
 Partition 0  (replication factor = 3)
@@ -99,11 +72,7 @@ Partition 0  (replication factor = 3)
   Broker 2 or 3 is elected new leader → traffic shifts automatically
 ```
 
-The set of followers that are fully caught up is called the **ISR — In-Sync Replicas**. If the leader dies, Kafka elects a new leader from the ISR. A replica that falls too far behind (controlled by `replica.lag.time.max.ms`) is removed from the ISR until it catches up.
-
-### Partition Leadership Distribution
-
-Kafka spreads partition leaders evenly across brokers. With 12 partitions and 3 brokers, each broker leads roughly 4 partitions — distributing both CPU and network load.
+- Kafka spreads partition leaders evenly across brokers. With 12 partitions and 3 brokers, each broker leads roughly 4 partitions — distributing both CPU and network load.
 
 ```
 3-broker cluster, 12 partitions:
@@ -111,33 +80,21 @@ Kafka spreads partition leaders evenly across brokers. With 12 partitions and 3 
   Broker 1: leads P0, P3, P6, P9    (also follows P1,P2,P4,P5,P7,P8,P10,P11)
   Broker 2: leads P1, P4, P7, P10
   Broker 3: leads P2, P5, P8, P11
-```
 
 In our 3-broker, RF=2 setup, each partition has 1 leader and 1 follower:
-
-```
-Topic: orders  (4 partitions, replication factor: 2)
-
-Partition 0:  Leader → Broker 1 (zone-a)  |  Replica → Broker 2 (zone-b)
-Partition 1:  Leader → Broker 2 (zone-b)  |  Replica → Broker 3 (zone-c)
-Partition 2:  Leader → Broker 3 (zone-c)  |  Replica → Broker 1 (zone-a)
-Partition 3:  Leader → Broker 1 (zone-a)  |  Replica → Broker 3 (zone-c)
+  Topic: orders  (4 partitions, replication factor: 2)
+    Partition 0:  Leader → Broker 1 (zone-a)  |  Replica → Broker 2 (zone-b)
+    Partition 1:  Leader → Broker 2 (zone-b)  |  Replica → Broker 3 (zone-c)
+    Partition 2:  Leader → Broker 3 (zone-c)  |  Replica → Broker 1 (zone-a)
+    Partition 3:  Leader → Broker 1 (zone-a)  |  Replica → Broker 3 (zone-c)
 ```
 
-### The Controller Broker
+- Historically Kafka used **ZooKeeper** — a separate cluster — to store metadata: which broker is controller, which partitions have which leaders, ISR lists, etc. This meant running and maintaining a separate ZooKeeper ensemble alongside every Kafka cluster. Modern Kafka (3.x+) replaces this with **KRaft** — Kafka's own Raft-based consensus built directly in. Brokers elect a **controller** amongst themselves. No external dependency, simpler operations, and faster metadata operations. 
 
-One broker is elected **controller**. It has extra duties: tracking which brokers are alive, re-assigning partition leadership when a broker dies, and processing topic creation/deletion. It is still an ordinary broker — just with added responsibilities. If it fails, another broker takes over via a fast election.
-
-### ZooKeeper vs KRaft
-
-Historically Kafka used **ZooKeeper** — a separate cluster — to store metadata: which broker is controller, which partitions have which leaders, ISR lists, etc. This meant running and maintaining a separate ZooKeeper ensemble alongside every Kafka cluster.
-
-Modern Kafka (3.x+) replaces this with **KRaft** — Kafka's own Raft-based consensus built directly in. Brokers elect a controller amongst themselves. No external dependency, simpler operations, and faster metadata operations. Our cluster runs 4.3.1 in KRaft mode — no ZooKeeper anywhere.
-
-### A Produce Request's Journey Through a Cluster
+- A Produce request's journey through a cluster
 
 ```
-1. Producer asks any broker: "who leads partition 2 of topic battery.telemetry?"
+1. Producer asks any broker: "who leads partition 2 of topic warehouse.events?"
 2. Broker responds: "Broker 3 leads that partition"
 3. Producer connects directly to Broker 3, sends the compressed batch
 4. Broker 3 writes the batch to its local log
@@ -152,112 +109,15 @@ Producer ──► Broker 3 (leader)
                   └──► "OK, offset 10042" ──► Producer
 ```
 
----
+- When a producer sends a record, it can ask Kafka for different levels of confirmation before considering the write "done." This is the `acks` setting — the single most important knob for balancing throughput vs. durability.
+  - acks=0: Fire and Forget. The producer sends the message and **does not wait for any acknowledgement** from the broker. As soon as the message hits the network socket buffer, the producer considers it sent. Kafka may or may not have written it to disk. If the broker crashes between receiving and persisting, the message is gone. The producer has no idea whether it was received. Returned offset is always `-1` (meaningless). Retries do nothing — the producer can't know what failed. **When to use:** Metrics, logs, or telemetry where occasional loss is acceptable and maximum throughput is the goal. Never for financial, transactional, or auditable data. **Throughput:** Maximum possible — no network roundtrip for acks.
+  - acks=1: Leader Acknowledgement Only. The leader writes the record to its local log and immediately acknowledges the producer. It does **not** wait for followers to replicate. **The risk — "leader fails after ack, before follower replicates":**. On Spot VMs, evictions are sudden — the VM can vanish with little warning. **When to use:** Medium-criticality streams where some data loss is tolerable but throughput matters. **Throughput:** High — one network roundtrip, no follower coordination.
+  - acks=all (or acks=-1): Full ISR (in-sync replica) Acknowledgement. The leader waits until **all in-sync replicas** have written the record before acknowledging the producer. This is the strongest durability guarantee Kafka offers. **The critical companion — eg: min.insync.replicas=2**. This sets the minimum ISR size required for a write to succeed. If the ISR shrinks below this value (e.g., the follower is evicted), Kafka refuses new writes with `NotEnoughReplicasException`. Without this guard: if ISR = `{leader only}`, `acks=all` would only wait for the leader — which completely defeats the purpose. `replication.factor=3` with `min.insync.replicas=2` is the standard production setup. It tolerates one broker failure without compromising durability or blocking writes. **When to use:** Any data where loss is unacceptable. Required for idempotent and exactly-once producers. **Throughput:** Lower than acks=1 — the roundtrip includes follower replication latency. In a same-region multi-zone cluster, this is typically 5–20ms added latency.
 
-## Part 3 — Producer Acknowledgement: The acks Setting
 
-When a producer sends a record, it can ask Kafka for different levels of confirmation before considering the write "done." This is the `acks` setting — the single most important knob for balancing throughput vs. durability.
 
-### acks=0: Fire and Forget
+ 
 
-```
-Producer ──► Broker (no wait)  ──► socket buffer
-                                    (message may or may not persist)
-```
-
-The producer sends the message and **does not wait for any acknowledgement** from the broker. As soon as the message hits the network socket buffer, the producer considers it sent.
-
-- Kafka may or may not have written it to disk
-- If the broker crashes between receiving and persisting, the message is gone
-- The producer has no idea whether it was received
-- Returned offset is always `-1` (meaningless)
-- **Retries do nothing** — the producer can't know what failed
-
-**When to use:** Metrics, logs, or telemetry where occasional loss is acceptable and maximum throughput is the goal. Never for financial, transactional, or auditable data.
-
-**Throughput:** Maximum possible — no network roundtrip for acks.
-
-### acks=1: Leader Acknowledgement Only
-
-```
-Producer ──► Leader Broker
-                │
-                ├── Writes to leader's local log
-                ├── Sends ACK back to producer  ◄── producer considers it done here
-                │
-                └── (asynchronously) followers pull from leader
-```
-
-The leader writes the record to its local log and immediately acknowledges the producer. It does **not** wait for followers to replicate.
-
-**The risk — "leader fails after ack, before follower replicates":**
-
-```
-t=0: Producer sends message M
-t=1: Leader (Broker 1, zone-a) writes M to local log, sends ACK ✓
-t=2: Producer considers M "delivered"
-t=3: Follower (Broker 2, zone-b) hasn't pulled M yet
-t=4: Broker 1 Spot VM is evicted ← M is LOST
-t=5: Broker 2 becomes new leader — it has no record of M
-```
-
-On Spot VMs, evictions are sudden — the VM can vanish with little warning. With RF=2 and acks=1, this window is real.
-
-**When to use:** Medium-criticality streams where some data loss is tolerable but throughput matters.
-
-**Throughput:** High — one network roundtrip, no follower coordination.
-
-### acks=all (or acks=-1): Full ISR Acknowledgement
-
-```
-Producer ──► Leader Broker
-                │
-                ├── Writes to leader's local log
-                ├── Waits for all ISR replicas to acknowledge
-                │       │
-                │       └── Follower pulls from leader, writes, sends ack to leader
-                │
-                └── Sends ACK back to producer  ◄── producer considers it done here
-```
-
-The leader waits until **all in-sync replicas** have written the record before acknowledging the producer. This is the strongest durability guarantee Kafka offers.
-
-In our 3-broker, RF=2 cluster: ISR = `{leader, 1 follower}`. So `acks=all` means the record is on 2 brokers before the producer gets an ACK. Even if one broker is evicted immediately after, the message is safe on the surviving broker.
-
-**The critical companion — min.insync.replicas:**
-
-```properties
-min.insync.replicas=2
-```
-
-This sets the minimum ISR size required for a write to succeed. If the ISR shrinks below this value (e.g., the follower is evicted), Kafka refuses new writes with `NotEnoughReplicasException`.
-
-Without this guard: if ISR = `{leader only}`, `acks=all` would only wait for the leader — which completely defeats the purpose.
-
-**Durability matrix for our RF=2 cluster:**
-
-| acks | min.insync.replicas | Copies before ACK | Survives leader eviction? |
-|---|---|---|---|
-| 0 | any | 0 | No |
-| 1 | any | 1 | No |
-| all | 1 | 1 | No |
-| all | 2 | 2 | **Yes** |
-
-> **Rule of thumb:** `replication.factor=3` with `min.insync.replicas=2` is the standard production setup. It tolerates one broker failure without compromising durability or blocking writes.
-
-**When to use:** Any data where loss is unacceptable. Required for idempotent and exactly-once producers.
-
-**Throughput:** Lower than acks=1 — the roundtrip includes follower replication latency. In a same-region multi-zone cluster, this is typically 5–20ms added latency.
-
----
-
-## Part 4 — Producer Configs Explained
-
-Beyond `acks`, several other producer configs have significant impact on throughput, latency, memory, and reliability.
-
-### RequiredAcks — Covered above
-
-Use `acks=all`. Non-negotiable for durable systems.
 
 ### batch.size and linger.ms — Throughput Tuning
 
