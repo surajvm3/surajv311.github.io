@@ -6,7 +6,7 @@ category: technicalArticles
 
 > From my experience working at [GreyOrange](https://www.greyorange.com/). Refactored my article a bit with help of GPT. 
 
-I was working on a service with a senior engineer that would produce events to Kafka. The entire pipeline from service to kafka to downstream consumers had to be exactly once, hence as part of work, I came across interesting producer configs, which I will discuss. 
+I was working on a service with a senior engineer that did some light processing and produced events to Kafka in the background. The entire pipeline from service to kafka to downstream consumers had to be exactly-once, hence as part of work, I came across interesting producer configs, which I will discuss. 
 
 Although before that, a quick brush up of Kafka. I am assuming below Kafka configs, based on which I will discuss few things, pretty similar to a setup I was working on: 
 
@@ -109,22 +109,17 @@ Producer ──► Broker 3 (leader)
                   └──► "OK, offset 10042" ──► Producer
 ```
 
-- When a producer sends a record, it can ask Kafka for different levels of confirmation before considering the write "done." This is the `acks` setting — the single most important knob for balancing throughput vs. durability.
-  - acks=0: Fire and Forget. The producer sends the message and **does not wait for any acknowledgement** from the broker. As soon as the message hits the network socket buffer, the producer considers it sent. Kafka may or may not have written it to disk. If the broker crashes between receiving and persisting, the message is gone. The producer has no idea whether it was received. Returned offset is always `-1` (meaningless). Retries do nothing — the producer can't know what failed. **When to use:** Metrics, logs, or telemetry where occasional loss is acceptable and maximum throughput is the goal. Never for financial, transactional, or auditable data. **Throughput:** Maximum possible — no network roundtrip for acks.
-  - acks=1: Leader Acknowledgement Only. The leader writes the record to its local log and immediately acknowledges the producer. It does **not** wait for followers to replicate. **The risk — "leader fails after ack, before follower replicates":**. On Spot VMs, evictions are sudden — the VM can vanish with little warning. **When to use:** Medium-criticality streams where some data loss is tolerable but throughput matters. **Throughput:** High — one network roundtrip, no follower coordination.
-  - acks=all (or acks=-1): Full ISR (in-sync replica) Acknowledgement. The leader waits until **all in-sync replicas** have written the record before acknowledging the producer. This is the strongest durability guarantee Kafka offers. **The critical companion — eg: min.insync.replicas=2**. This sets the minimum ISR size required for a write to succeed. If the ISR shrinks below this value (e.g., the follower is evicted), Kafka refuses new writes with `NotEnoughReplicasException`. Without this guard: if ISR = `{leader only}`, `acks=all` would only wait for the leader — which completely defeats the purpose. `replication.factor=3` with `min.insync.replicas=2` is the standard production setup. It tolerates one broker failure without compromising durability or blocking writes. **When to use:** Any data where loss is unacceptable. Required for idempotent and exactly-once producers. **Throughput:** Lower than acks=1 — the roundtrip includes follower replication latency. In a same-region multi-zone cluster, this is typically 5–20ms added latency.
+**acks - Durability vs Throughput**
+- When a producer sends a record, it can ask Kafka for different levels of confirmation before considering the write "done." This is the `acks` setting. 
+  - **acks=0**: Fire and Forget. The producer sends the message and **does not wait for any acknowledgement** from the broker. As soon as the message hits the network socket buffer, the producer considers it sent. Kafka may or may not have written it to disk. If the broker crashes between receiving and persisting, the message is gone. The producer has no idea whether it was received. Returned offset is always `-1` (meaningless). Retries do nothing — the producer can't know what failed. **When to use:** Metrics, logs, or telemetry where occasional loss is acceptable and maximum throughput is the goal. Never for financial, transactional, or auditable data. **Throughput:** Maximum possible — no network roundtrip for acks.
+  - **acks=1**: Leader Acknowledgement Only. The leader writes the record to its local log and immediately acknowledges the producer. It does **not** wait for followers to replicate. **The risk — "leader fails after ack, before follower replicates":**. On Spot VMs, evictions are sudden — the VM can vanish with little warning. **When to use:** Medium-criticality streams where some data loss is tolerable but throughput matters. **Throughput:** High — one network roundtrip, no follower coordination.
+  - **acks=all (or acks=-1)**: Full ISR (in-sync replica) Acknowledgement. The leader waits until **all in-sync replicas** have written the record before acknowledging the producer. This is the strongest durability guarantee Kafka offers. **The critical companion — eg: min.insync.replicas=2**. This sets the minimum ISR size required for a write to succeed. If the ISR shrinks below this value (e.g., the follower is evicted), Kafka refuses new writes with `NotEnoughReplicasException`. Without this guard: if ISR = `{leader only}`, `acks=all` would only wait for the leader — which completely defeats the purpose. `replication.factor=3` with `min.insync.replicas=2` is the standard production setup. It tolerates one broker failure without compromising durability or blocking writes. **When to use:** Any data where loss is unacceptable. Required for idempotent and exactly-once producers. **Throughput:** Lower than acks=1 — the roundtrip includes follower replication latency. In a same-region multi-zone cluster, this is typically 5–20ms added latency.
 
-
-
- 
-
-
-### batch.size and linger.ms — Throughput Tuning
-
-The producer accumulates records into batches before sending. Two configs control when a batch is flushed:
-
-- **`batch.size`** — maximum bytes in a single produce batch. Once a batch hits this size, it is sent immediately.
-- **`linger.ms`** — how long the producer waits to fill a batch before sending even if it isn't full yet. Default is `0` (send immediately).
+**batch.size and linger.ms — Throughput Tuning**
+- The producer accumulates records into batches before sending. Two configs control when a batch is flushed:
+  - **`batch.size`** — maximum bytes in a single produce batch. Once a batch hits this size, it is sent immediately.
+  - **`linger.ms`** — how long the producer waits to fill a batch before sending even if it isn't full yet. Default is `0` (send immediately).
+  - Setting `linger.ms` to 5–20ms dramatically improves throughput on high-volume topics by allowing more records to accumulate per batch, at the cost of tiny and usually imperceptible latency increases. 
 
 ```
 linger.ms=0:
@@ -135,15 +130,10 @@ linger.ms=10:
   (slightly higher latency, dramatically better throughput)
 ```
 
-Setting `linger.ms` to 5–20ms dramatically improves throughput on high-volume topics by allowing more records to accumulate per batch, at the cost of tiny and usually imperceptible latency increases. This is one of the most impactful and least disruptive Kafka producer tuning levers.
-
-### max.in.flight.requests.per.connection — Parallelism vs. Ordering
-
-How many produce requests can be in-flight simultaneously to one broker. More in-flight requests = more parallelism = higher throughput. But there is a catch:
-
-Without idempotence: if you send batches A and B, A fails and retries after B succeeds, the partition log ends up with B before A — **ordering is violated**.
-
-With the **idempotent producer**, this is capped at **5** — Kafka's enforced maximum that still maintains ordering via sequence numbers. You get parallelism without reordering risk.
+**max.in.flight.requests.per.connection — Parallelism vs Ordering**
+- How many produce requests can be in-flight simultaneously to one broker. More in-flight requests = more parallelism = higher throughput. But there is a catch:
+- Without idempotence: if you send batches A and B, A fails and retries after B succeeds, the partition log ends up with B before A — **ordering is violated**.
+- With the **idempotent producer**, this is capped at **5** — Kafka's enforced maximum that still maintains ordering via sequence numbers. You get parallelism without reordering risk.
 
 ```properties
 # With idempotent producer (required):
@@ -153,22 +143,20 @@ max.in.flight.requests.per.connection=5   # max allowed; kafka enforces ordering
 max.in.flight.requests.per.connection=10+  # reordering possible on retry
 ```
 
-### ProduceRequestTimeout — Single RPC Timeout
-
-How long the producer waits for a response to a single produce RPC. If the broker does not respond in this window, the request fails and is retried.
-
-Think of it as: *"how patient am I with one individual network call?"*
+**ProduceRequestTimeout — Single RPC Timeout**
+- How long the producer waits for a response to a single produce RPC. If the broker does not respond in this window, the request fails and is retried. Think of it as: *"how patient am I with one individual network call?"*
+  - Too low → spurious timeouts under transient load spikes trigger unnecessary retries.
+  - Too high → a stuck broker ties up the producer for a long time before retrying.
 
 ```properties
 request.timeout.ms=5000   # 5 seconds per RPC attempt
 ```
 
-Too low → spurious timeouts under transient load spikes trigger unnecessary retries.
-Too high → a stuck broker ties up the producer for a long time before retrying.
-
-### RecordDeliveryTimeout — Total Retry Budget per Record
-
-Kafka clients retry failed batches automatically. `delivery.timeout.ms` is the total wall-clock budget for one record — from first attempt to final delivery across all retries.
+**RecordDeliveryTimeout — Total Retry Budget per Record**
+- Kafka clients retry failed batches automatically. `delivery.timeout.ms` is the total wall-clock budget for one record — from first attempt to final delivery across all retries. The relationship between the two:
+  - `request.timeout.ms` = timeout for **one attempt**
+  - `delivery.timeout.ms` = total budget across **all attempts**
+  - `delivery.timeout.ms` must be ≥ `request.timeout.ms`
 
 ```
 t=0:00  Record enqueued, Kafka unreachable
@@ -184,29 +172,10 @@ t=2:00  delivery.timeout.ms expires → ErrRecordTimeout
 delivery.timeout.ms=120000   # 2 minutes total retry window
 ```
 
-The relationship between the two:
-- `request.timeout.ms` = timeout for **one attempt**
-- `delivery.timeout.ms` = total budget across **all attempts**
-- `delivery.timeout.ms` must be ≥ `request.timeout.ms`
-
-### MaxBufferedRecords — In-Memory Cap
-
-The producer keeps an internal in-memory buffer of records waiting to be batched and sent. `max.buffered.records` (or equivalent in your client library) caps how many can sit in that buffer.
-
-When the buffer is full (e.g., Kafka is unreachable and records pile up), new produce attempts are rejected immediately — no blocking, no OOM.
-
-```
-HTTP request → produce() → [internal buffer, max N records]
-                                    │
-                                    └──► batcher → broker → ack
-
-If buffer fills (Kafka unreachable):
-  produce() → ErrMaxBuffered → caller handles the drop
-```
-
-Without a cap, a slow or dead broker causes the producer to accumulate records in memory until the process OOMs. The cap trades *some* data loss for process stability — an acceptable trade-off for most systems.
-
-**Sensible sizing:**
+**MaxBufferedRecords — In-Memory Cap**
+- The producer keeps an internal in-memory buffer of records waiting to be batched and sent. `max.buffered.records` (or equivalent in your client library) caps how many can sit in that buffer.
+- When the buffer is full (e.g., Kafka is unreachable and records pile up), new produce attempts are rejected immediately — no blocking, no OOM.
+- Without a cap, a slow or dead broker causes the producer to accumulate records in memory until the process OOMs. The cap trades *some* data loss for process stability — an acceptable trade-off for most systems. Eg: 
 
 | Bound | Value | Reason |
 |---|---|---|
@@ -214,32 +183,31 @@ Without a cap, a slow or dead broker causes the producer to accumulate records i
 | Reasonable default | 50,000 | Safe starting point for moderate write rates |
 | Upper guard | 500,000 | Beyond this, memory pressure becomes real |
 
-### ProducerBatchCompression — Compress Before Sending
+```
+HTTP request → produce() → [internal buffer, max N records]
+                                    │
+                                    └──► batcher → broker → ack
+If buffer fills (Kafka unreachable):
+  produce() → ErrMaxBuffered → caller handles the drop
+```
+
+**ProducerBatchCompression — Compress Before Sending**
+- The producer compresses entire **batches** (not individual messages) before sending to the broker. zstd achieves better ratios than gzip/snappy at similar CPU cost. Compressing at batch level amortises the CPU cost across many records per batch.
+- **Note**: also set `compression.type=producer` on the topic. This tells the broker: *"store batches exactly as I sent them, do not recompress."* Without this, the broker may decompress your zstd batch and re-compress with the cluster default codec — wasting CPU on both ends and potentially changing the wire format for downstream consumers.
+
+| Codec | Ratio | CPU cost | When to use |
+|---|---|---|---|
+| `gzip` | Highest | Highest | Legacy; rarely the right choice today |
+| `snappy` | Lower | Very low | CPU-bottlenecked producers |
+| `lz4` | Good | Low | Strong default on constrained CPU budgets |
+| `zstd` | Often beats gzip | Lower than gzip | Good general-purpose default |
 
 ```properties
 compression.type=zstd   # on the producer
 ```
 
-The producer compresses entire **batches** (not individual messages) before sending to the broker. **zstd** is a strong choice because:
-
-- Line-protocol or JSON data is highly repetitive text — field names, measurement names, tags repeat constantly. Compression ratios of 5x–10x are typical.
-- zstd achieves better ratios than gzip/snappy at similar CPU cost.
-- Compressing at batch level amortises the CPU cost across many records per batch.
-
-**Critical: also set `compression.type=producer` on the topic:**
-
-```properties
-# Topic config (set at topic creation or via admin API)
-compression.type=producer
-```
-
-This tells the broker: *"store batches exactly as I sent them, do not recompress."* Without this, the broker may decompress your zstd batch and re-compress with the cluster default codec — wasting CPU on both ends and potentially changing the wire format for downstream consumers.
-
----
-
-## Part 5 — The Three Delivery Guarantees
-
-Every messaging system makes one of three promises about delivery. It is worth naming them clearly before going into exactly-once mechanics.
+**Idempotent Producer: Eliminating Duplicates on Retry**
+- Every messaging system makes one of three promises about delivery.
 
 | Guarantee | What It Means | Risk |
 |---|---|---|
@@ -247,38 +215,28 @@ Every messaging system makes one of three promises about delivery. It is worth n
 | **At-least-once** | Eventually delivered. Might be delivered more than once. | Duplicates |
 | **Exactly-once** | Delivered exactly once. No loss, no duplicates. | Requires deliberate config |
 
-Most Kafka producers default to **at-least-once** — they retry on failure, which is correct, but that retry can produce duplicates if the broker already wrote the message but the ack was lost.
-
----
-
-## Part 6 — Idempotent Producer: Eliminating Duplicates on Retry
-
-Even with `acks=all`, there is a subtle problem: **producer retries create duplicates.**
+- Even with `acks=all`, there is a subtle problem: **producer retries create duplicates.**
 
 ```
 Producer                    Broker
    │                            │
    ├──── Batch (seq=0) ────────►│  broker writes to log, prepares ack
-   │                             │
-   │         [network blip]      │
-   │◄──── (ack never arrives)    │
-   │                             │
-   │  "I didn't get an ack,      │
-   │   I'll retry"               │
+   │                            │
+   │         [network blip]     │
+   │◄──── (ack never arrives)   │
+   │                            │
+   │  "I didn't get an ack,     │
+   │   I'll retry"              │
    ├──── Batch (seq=0) ────────►│  ← broker writes it AGAIN (duplicate!)
    │◄──── "OK" ─────────────────│
 ```
 
-The producer cannot distinguish "ack was lost" from "write failed." So it retries. The broker, without idempotence, has no memory of the first write. You get a duplicate record.
-
-### How the Idempotent Producer Solves This
-
-Enable via `enable.idempotence=true` (modern clients enable this by default when `acks=all`):
-
-1. The broker assigns the producer a **Producer ID (PID)** — a unique integer for this producer instance's lifetime.
-2. Each partition gets its own monotonically increasing **sequence number**.
-3. Every batch is stamped with `(PID, partition, sequence_number)`.
-4. If the broker receives a batch with a sequence number it has already written, it accepts the request (returns success) but **silently discards the duplicate**.
+- The producer cannot distinguish "ack was lost" from "write failed." So it retries. The broker, without idempotence, has no memory of the first write. You get a duplicate record.
+- Idempotent producer tries to solve this, enabled via: `enable.idempotence=true` (modern clients enable this by default when `acks=all`). It works by: 
+  - The broker assigns the producer a **Producer ID (PID)** — a unique integer for this producer instance's lifetime.
+  - Each partition gets its own monotonically increasing **sequence number**.
+  - Every batch is stamped with `(PID, partition, sequence_number)`.
+  - If the broker receives a batch with a sequence number it has already written, it accepts the request (returns success) but **silently discards the duplicate**.
 
 ```
 Producer (PID = 42)              Broker
@@ -292,41 +250,17 @@ Producer (PID = 42)              Broker
      │◄────── "OK" ──────────────────│
 ```
 
-No duplicate, even though a retry occurred.
+- Caveat: PID resets on producer restart: The PID is assigned fresh on each producer startup. If the process crashes and a new instance starts, it gets a new PID. The broker will not recognise retry attempts from the new instance as duplicates of the old one. A record that was in-flight at crash time could be written twice — once by the old instance (before crash) and once by the new instance (on startup retry). For most telemetry and event-streaming workloads, a single duplicate point on a process restart is acceptable — it is a known, bounded limitation of the idempotent producer without full transactions.
+- Idempotent producer gives you exactly-once *from producer to broker* within a single session. It does **not** give you:
+  - Exactly-once across multiple topics simultaneously
+  - Exactly-once from broker to consumer (the consumer commits its own offsets separately)
+  - End-to-end exactly-once across the full pipeline (producer → Kafka → consumer → database)
+  - Exactly-once across producer restarts (PID resets)
 
-**Idempotence requirements:**
-
-```properties
-enable.idempotence=true
-acks=all                                       # required — kafka enforces this
-max.in.flight.requests.per.connection=5        # max allowed with idempotence
-retries=2147483647                             # must be > 0
-```
-
-### The Important Caveat: PID Resets on Producer Restart
-
-The PID is assigned fresh on each producer startup. If the process crashes and a new instance starts, it gets a new PID. The broker will not recognise retry attempts from the new instance as duplicates of the old one.
-
-A record that was in-flight at crash time could be written twice — once by the old instance (before crash) and once by the new instance (on startup retry).
-
-For most telemetry and event-streaming workloads, a single duplicate point on a process restart is acceptable — it is a known, bounded limitation of the idempotent producer without full transactions.
-
----
-
-## Part 7 — Exactly-Once Semantics (EOS): The Full Picture
-
-Idempotent producer gives you exactly-once *from producer to broker* within a single session. It does **not** give you:
-
-- Exactly-once across multiple topics simultaneously
-- Exactly-once from broker to consumer (the consumer commits its own offsets separately)
-- End-to-end exactly-once across the full pipeline (producer → Kafka → consumer → database)
-- Exactly-once across producer restarts (PID resets)
-
-For those, you need **Kafka Transactions**.
-
-### Transactions: Atomic Multi-Partition Writes
+For those, you need **Kafka Transactions**. But I read online, that if related configs are not tuned properly then Kafka transactions hurt throughput. 
 
 ```
+Eg: Transactions: Atomic Multi-Partition Writes
 Producer:
   beginTransaction()
     write(topic=A, partition=0, message=M1)
@@ -336,303 +270,38 @@ Producer:
   abortTransaction()    ← neither M1 nor M2 becomes visible
 ```
 
-A **transactional producer** is assigned a stable `transactional.id` that persists across restarts. When it restarts, it first resolves any in-flight transaction from the previous session (commit or abort), then starts fresh — no duplicates across restarts.
+- A **transactional producer** is assigned a stable `transactional.id` that persists across restarts. When it restarts, it first resolves any in-flight transaction from the previous session (commit or abort), then starts fresh — no duplicates across restarts.
+  - **Producer config for full exactly-once semantics:**
 
-**Producer config for full EOS:**
+    ```properties
+    enable.idempotence=true
+    transactional.id=my-unique-producer-id    # stable across restarts
+    acks=all
+    ```
 
-```properties
-enable.idempotence=true
-transactional.id=my-unique-producer-id    # stable across restarts
-acks=all
-```
+  - **Consumer config — only read committed messages:**: Without `read_committed`, consumers see messages from uncommitted (in-flight) transactions — which may later be aborted, causing **phantom reads**: the consumer processes a message that was never actually committed.
 
-**Consumer config — only read committed messages:**
+    ```properties
+    isolation.level=read_committed
+    ```
 
-```properties
-isolation.level=read_committed
-```
+**Other info**: 
+- Partition Key — Routing and Ordering: The record key controls which partition a record lands in. Records with the same key always go to the same partition (for a fixed partition count). Records with a `null` key are distributed by the client.
+  - **Keyed records:** gives ordering guarantees — all records for the same key arrive at the same partition in order. The risk: if one key generates disproportionately high traffic, one partition gets disproportionate load — the hot partition problem. A more granular key (e.g., `user_id + metric_type`) distributes load across partitions while still giving ordering within a category.
+  - **Null-keyed records:** since Kafka 2.4, the default partitioner for null-keyed records is the **sticky partitioner**, not round-robin. It writes to one partition until a batch fills or `linger.ms` expires, then rotates. This meaningfully improves batch fill rates on high-volume keyless topics — a 30–50% batching efficiency improvement over round-robin. If you need key identity for consumers (for routing or filtering) but don't want it to affect partitioning, put it in a **record header** instead of the key.
+- A producer does not fail immediately when a broker becomes unreachable. Retries and buffering absorb short outages transparently.
+- Two decisions made at topic creation that you mostly can't undo:
+  - **Partition count** — more partitions = more consumer parallelism, but also more replication overhead at the cluster level (100 partitions × 3 replicas = 300 replica slots to manage). A practical heuristic: partition count ≈ your target consumer parallelism. Kafka can **add** partitions to an existing topic. It **cannot remove them**. If you auto-create topics programmatically, guard against a config service returning a nonsense value (like 50,000 partitions) with a hard cap, and make sure your reconciliation logic only ever increases partition count, never decreases.
+  - **Replication factor** — typically 3 in production. With `min.insync.replicas=2` and `acks=all`, you can lose one broker and keep writing without pause.  
+- Running Kafka on Spot VMs is economical but introduces real eviction risk.
+- When your process shuts down, records may still be sitting in the buffer or a linger window, unsent. The correct pattern:
+  - Stop accepting new records.
+  - Call `flush()` with a reasonable timeout — give in-flight records a chance to drain.
+  - Call `close()`. Ensure the client library doesn't skip pending callbacks/flush(), as the object is being torn down.
 
-Without `read_committed`, consumers see messages from uncommitted (in-flight) transactions — which may later be aborted, causing **phantom reads**: the consumer processes a message that was never actually committed.
 
----
+------------------------------------
 
-## Part 8 — Other Important Configs Every Kafka Engineer Should Know
 
-### Producer Side
 
-**`linger.ms`** — Covered above. Set to 5–20ms for throughput-heavy topics.
-
-**`batch.size`** — Maximum bytes per batch. Tune alongside `linger.ms`. Larger batches = better throughput and compression, slightly more latency.
-
-**`transactional.id`** — If set, enables the transactional producer for full exactly-once across multiple partitions and producer restarts.
-
-**`max.in.flight.requests.per.connection`** — Capped at 5 with idempotence. Without idempotence, can be higher for throughput but risks reordering on retry.
-
-### Broker / Topic Side
-
-**`min.insync.replicas`** — Minimum ISR size for `acks=all` to succeed. Set to 2 when replication factor is 3. This is the guard that makes `acks=all` meaningful.
-
-**`retention.ms`** — How long messages are kept before old segments are deleted (default: 7 days). For pipelines where Kafka is a delivery buffer into a downstream store, shorter retention is fine — the data lands quickly and long retention just wastes disk.
-
-**`retention.bytes`** — Cap retention by size instead of (or in addition to) time. Useful for predictable capacity planning on bounded disk.
-
-**`compression.type` (topic-level)** — Set to `producer` to preserve the producer's compression codec. Any other value causes the broker to decompress and recompress — wasting CPU.
-
-### Consumer Side
-
-**`auto.offset.reset`** — What to do when a consumer group has no committed offset yet:
-- `earliest` — start from the beginning of the log
-- `latest` — start from now, skip all historical data
-
-Wrong choice here silently loses your entire backlog. In most production pipelines, `earliest` is safer.
-
-**`isolation.level`** — `read_committed` shows only committed transaction data. `read_uncommitted` (the default) shows everything including in-flight transactions that may later be aborted.
-
-**`enable.auto.commit`** — Whether the client automatically commits offsets on a timer. Disabling this and committing manually — *after* your processing is confirmed successful — gives you exactly-once semantics on the consumer side. Auto-commit risks committing an offset for a message your processing failed on.
-
----
-
-## Part 9 — Putting It Together: Our Spot VM Cluster
-
-Running Kafka on Spot VMs is economical but introduces real eviction risk.
-
-```
-Normal operation (all 3 brokers healthy):
-  RF=2, ISR={broker-1, broker-2}
-  acks=all → waits for 2 copies → safe
-
-One broker evicted (Spot eviction in zone-a):
-  RF=2, ISR shrinks to {leader only}
-  If min.insync.replicas=2 → writes BLOCK until follower catches up or broker returns
-  This is the right behavior — better to pause than to lose data silently
-
-PodDisruptionBudget: maxUnavailable=1:
-  GKE will not evict more than 1 broker pod at once during planned maintenance
-  Spot evictions bypass this — the cloud can reclaim the VM regardless
-  ⚠️  This is why RF=2 on Spot is risky for zero-write-pause guarantees
-      RF=3 would be safer: ISR can tolerate 1 loss and still have 2 members
-```
-
-**Recommended config for production on Spot + RF=2:**
-
-```properties
-# Producer
-acks=all
-enable.idempotence=true
-retries=2147483647
-max.in.flight.requests.per.connection=5
-request.timeout.ms=5000
-delivery.timeout.ms=120000
-linger.ms=10
-compression.type=zstd
-
-# Topic / Broker
-min.insync.replicas=2
-compression.type=producer
-
-# Consumer (for EOS pipelines)
-isolation.level=read_committed
-enable.auto.commit=false
-auto.offset.reset=earliest
-```
-
-**Trade-off:** With RF=2 and `min.insync.replicas=2`, losing one broker pauses writes until it recovers. With RF=3 and `min.insync.replicas=2`, losing one broker is fully transparent — the ISR still has 2 members and writes continue uninterrupted. On Spot-based clusters, RF=3 is the safer choice if write availability matters.
-
----
-
-## Part 10 — What Happens When Kafka Goes Down?
-
-A producer does not fail immediately when a broker becomes unreachable. Retries and buffering absorb short outages transparently.
-
-```
-t=0:00  Kafka becomes unreachable
-        produce() still enqueues records into in-memory buffer (broker issue ≠ enqueue failure)
-
-t=0:05  First produce attempt fails → queued for retry (with backoff)
-t=0:30  Retries continue; buffer fills slowly as new records arrive
-...
-t=2:00  delivery.timeout.ms expires → undelivered records get ErrRecordTimeout
-        → callback fires with error; records are dropped; metrics can count these
-
-If buffer fills before delivery.timeout.ms:
-        → ErrMaxBuffered → new records rejected at enqueue; older records still retrying
-
-t=2:30  Kafka comes back
-        Producer reconnects automatically, drains buffered records, catches up
-```
-
-**The silent danger — outage longer than retention:**
-If Kafka is unreachable for longer than the source retention window, buffered but undelivered records expire on the producer side. On reconnect, Kafka cannot replay what the producer dropped — those records are permanently lost. Monitor producer lag and delivery error metrics continuously and alert before the window closes.
-
----
-
-## Summary
-
-| Config | What It Controls |
-|---|---|
-| `acks=all` | Leader waits for all ISR replicas to confirm before acking producer |
-| `min.insync.replicas=2` | Guard: write fails if ISR drops below 2 (makes acks=all meaningful) |
-| `enable.idempotence=true` | Broker deduplicates retries via PID + sequence number |
-| `transactional.id` | Stable producer identity across restarts; enables atomic multi-partition writes |
-| `isolation.level=read_committed` | Consumer only sees committed transaction data, no phantom reads |
-| `enable.auto.commit=false` | Manual offset commit after confirmed processing = consumer-side EOS |
-| `linger.ms` | Batch accumulation window; trade tiny latency for big throughput gains |
-| `max.in.flight.requests.per.connection=5` | Parallelism cap that preserves ordering with idempotence |
-| `request.timeout.ms` | Single RPC attempt timeout |
-| `delivery.timeout.ms` | Total retry window per record across all attempts |
-| `compression.type=zstd` (producer) | Compress batches before sending; 5–10x ratio on text data |
-| `compression.type=producer` (topic) | Broker stores as-is; prevents wasteful decompress + recompress |
-
-**Key insight — acks=all alone is not enough:** Without `min.insync.replicas=2`, `acks=all` can silently degrade to single-copy durability when replicas fall out of the ISR. Always configure both together.
-
-**Key insight — idempotence covers one session:** The PID resets on producer restart. For cross-restart exactly-once guarantees, you need `transactional.id`.
-
-**Key insight — linger.ms is underused:** The default of `0` is optimised for latency, not throughput. Setting it to 5–20ms on high-volume topics is one of the highest-ROI Kafka tuning changes you can make.
-
-
-
-Kafka Producer Knobs:
-
-This is a rundown of the producer settings that actually matter, what they're trading off, and the failure modes they're protecting against.
-
-The buffer: max.buffered.records (or buffer.memory in the Java client)
-
-The producer keeps an in-memory queue of records waiting to be sent. This setting controls how large that queue can get.
-
-The reason this exists: your application produces records at whatever rate it produces them. Kafka brokers receive records at whatever rate they can handle. These two rates are almost never the same. The buffer absorbs the difference — your application keeps running while the producer drains the queue in the background.
-
-What happens when the buffer fills up is the interesting part, and it's a deliberate choice with real consequences:
-
-Block the caller until space frees up. This backpressures the producing side, which is fine if you can afford to slow down. Not fine if you're in an HTTP request handler.
-Drop the record immediately and return an error. This is "fire and forget with a hard cap." You lose data but you never slow down the caller.
-
-Neither is wrong. They're for different situations. A background analytics event pipeline can usually afford to block. A real-time write path that's mirroring data to Kafka as a secondary concern should probably drop and log rather than hold up the primary operation.
-
-Setting this too low means any brief Kafka hiccup (broker GC pause, rolling restart) fills the buffer and you start dropping or blocking. Setting it too high means your process can silently accumulate gigabytes of undelivered records before you notice Kafka is unreachable.
-
-A reasonable starting point is something that covers 30–60 seconds of your peak throughput.
-
-Two different timeouts that people constantly confuse
-request.timeout.ms — one network round trip
-
-This is the deadline for a single Kafka protocol request. When the producer sends a batch to a broker, it waits up to this long for an acknowledgment. If the broker doesn't respond in time, the request fails and the producer retries.
-
-This is a per-attempt timeout, not a total timeout.
-
-Set this too short and you'll get spurious timeouts during normal broker behavior: GC pauses, leader elections, slow replication. The producer retries, which increases load, which can make things worse. Under 1 second is almost always wrong for production.
-
-delivery.timeout.ms — total record lifetime
-
-This is how long a record can live in the producer before it's permanently abandoned. The producer will keep retrying failed requests (each one bounded by request.timeout.ms) until delivery.timeout.ms expires, at which point the record is dropped and the callback fires with an error.
-
-These two work together. With request.timeout.ms=5s and delivery.timeout.ms=5m, a record can survive up to five minutes of Kafka being completely unreachable, with the producer attempting a new request every 5 seconds or so. After 5 minutes, it gives up.
-
-The minimum for delivery.timeout.ms worth thinking about: Kafka rolling restarts typically take 10–20 seconds per broker. If your delivery timeout is shorter than a rolling restart, you'll drop records during routine maintenance. 30–60 seconds is a reasonable floor.
-
-The practical maximum is driven by memory. Records sitting in the buffer waiting for delivery are bytes sitting in your heap. At high throughput, "records that will never be delivered" filling up memory is a real OOM path.
-
-linger.ms — batching delay
-
-The producer waits up to this many milliseconds before sending a batch, collecting more records in the meantime. More records per batch means better compression ratios and fewer network round trips.
-
-The tension: linger adds latency. For a 200ms linger, the first record in a batch might wait up to 200ms before it goes out. For most async/background producers this is fine. For anything latency-sensitive it might not be.
-
-One thing worth knowing: linger time counts against a record's delivery.timeout.ms. A record that waits 200ms in a linger window has 200ms less of its delivery timeout remaining. At normal settings this is insignificant. But if you're tuning a very short delivery timeout (say, 30s), a 200ms linger is a small but real reduction in your retry budget.
-
-At low throughput — under a few hundred records per second per partition — linger is mostly useful because batches would otherwise contain a single record and you'd compress nothing. At high throughput, batches fill naturally before the linger window expires and the setting barely matters.
-
-acks — who needs to confirm before the broker says "done"
-
-acks=0: Don't wait for confirmation at all. Maximum throughput, zero durability guarantees.
-
-acks=1: The partition leader confirms it wrote the record. If the leader crashes before replicating, the record is gone.
-
-acks=all (or acks=-1): Every in-sync replica confirms the write. The broker only acknowledges after the record is safe on all replicas. If the leader crashes immediately after acknowledging, any in-sync follower can take over without data loss.
-
-For any use case where losing records is genuinely unacceptable, acks=all is the only real option. The throughput hit is real but usually smaller than people expect — the acknowledgment from replicas happens in parallel, and the latency is dominated by network round trips to the broker, not replication.
-
-acks=all is also required for idempotent writes. Which brings us to:
-
-Idempotent producer (enable.idempotence=true)
-
-When the producer sends a batch and doesn't get an acknowledgment in time, it retries. Without idempotence, if the first send actually succeeded (the ack just got lost in transit), the retry causes a duplicate. With idempotence, the broker detects the retry using a sequence number and discards it.
-
-This is particularly important if you have retry logic at the application level too. Without idempotence, a network blip can cause records to appear twice in Kafka even if you haven't written any retry logic yourself.
-
-Idempotence requires acks=all and max.in.flight.requests.per.connection ≤ 5. In most clients it's enabled automatically when acks=all is set, or there's a single flag to turn on both.
-
-If you need exactly-once delivery end-to-end (not just no duplicates from retries, but no duplicates when your consumer processes records), you need Kafka transactions — a much heavier mechanism. Idempotent producer + acks=all gets you "at least once with deduplication at the broker." Transactions get you "exactly once across produce and consume."
-
-Compression
-
-Line-protocol telemetry, JSON events, log lines — almost all Kafka payloads are highly compressible text with repetitive field names.
-
-The contenders:
-
-gzip: Highest compression ratio, highest CPU cost. Was the standard choice for years.
-snappy: Lower compression ratio, very low CPU cost. Good when CPU is the bottleneck.
-lz4: Faster than gzip at similar compression ratios. Good middle ground.
-zstd: Often beats gzip on compression ratio with less CPU than gzip. The current recommended default for most use cases.
-
-For repetitive telemetry data (same field names, same measurement names, lots of numerical values), zstd compression ratios of 10–20x are common. At those ratios you're sending a tenth of the bytes across the wire, which matters a lot if Kafka is on a different network segment or cross-region.
-
-One broker-side setting to check: compression.type on the topic. If it's set to something specific (say, gzip), the broker will recompress your zstd batches. Set it to producer and the broker stores batches exactly as received without touching them.
-
-Partition key — nil vs something meaningful
-
-The record key controls which partition a record lands in. Records with the same key always go to the same partition (within a topic's current partition count). Records with a nil/null key are typically distributed evenly across partitions by the client.
-
-Keying by something like a tenant ID or entity ID gives ordering guarantees: all records for the same tenant are in the same partition, so a consumer sees them in order. It also means that tenant's write rate determines that partition's load. If one tenant writes 100x more than others, one partition gets 100x the traffic. This is the hot partition problem.
-
-Keying by nil (round-robin or random) spreads load evenly but you lose ordering guarantees across partitions.
-
-A middle ground: use a key that's more granular than "one per tenant" — something like tenant_id + metric_type — so load spreads across multiple partitions while still giving you ordering within a category.
-
-If you need tenant identity preserved for consumers but don't want it to affect partitioning, put it in a record header instead of the key.
-
-Partition count and the partition reconciliation problem
-
-Topics need to exist with enough partitions before you start producing. The two decisions you make at topic creation:
-
-Partition count: More partitions = more parallelism for consumers. But partitions are the unit of Kafka's replication overhead. 100 partitions with 3 replicas = 300 replica "slots" the cluster manages. Very high partition counts cause real cluster overhead. A good starting heuristic: partition count ≈ your target consumer parallelism. If you want 10 consumer threads processing a topic, 10–20 partitions is reasonable.
-
-Replication factor: Typically 3 for production. With min.insync.replicas=2 and acks=all, you can lose one broker and keep writing.
-
-Kafka can add partitions to an existing topic. It cannot remove them. This asymmetry matters if you're auto-creating topics programmatically: if your code creates a topic with 3 partitions, then configuration changes to want 10, you can reconcile up. If it changes to want 2, you're stuck at 3. Worth guarding against a config service returning a nonsense value (like 50,000 partitions) with a hard cap in whatever creates topics.
-
-Shutdown: flush before close
-
-When your process shuts down, there are probably records in the buffer that haven't been sent yet. If you just call close(), what happens to them depends on the client.
-
-The correct pattern:
-
-Stop accepting new records.
-Call flush() with a reasonable timeout — give in-flight records a chance to drain.
-Call close().
-
-Without the flush, records sitting in the linger window or waiting in the buffer just get dropped. With it, a clean shutdown loses nothing. The timeout on flush() matters: set it too short and you're back to dropping. Set it too long and your deployment pipeline stalls. Something in the range of your delivery.timeout.ms / 6 is reasonable — enough to get through one or two broker retry cycles.
-
-Monitoring what actually matters
-
-The metrics that tell you something useful:
-
-Record send rate vs record error rate — errors here mean records that couldn't be delivered within delivery.timeout.ms. Baseline should be zero. Any uptick is worth investigating immediately.
-
-Producer request latency — how long round trips to the broker are taking. A sudden increase tells you about broker-side problems before they cascade to delivery.timeout.ms expirations.
-
-Buffer utilization — how full the record buffer is as a fraction of its max. Under 50% at peak load is comfortable. Consistently above 80% means you're close to starting to drop or block.
-
-Batch size distribution — if your average batch size is 1 record, compression is doing nothing for you and you're wasting round trips. Either increase linger or accept that your throughput is just low and that's fine.
-
-Compression ratio — most clients expose this. For text telemetry, under 3x compression is a signal that something's wrong with how records are being batched.
-
-The one thing that surprises most people
-
-When you call close() on a producer client, many client libraries do not wait for all pending callbacks to finish before returning. The client is closed, but the callback goroutines/threads are still running and will try to touch your producer's metrics or state after the object is being torn down.
-
-This is a real race condition and a real source of crashes in high-throughput producers during shutdown. The fix is to track in-flight callbacks with a wait group (or equivalent), increment before each produce, decrement in the callback, and wait for the count to hit zero before returning from your close method.
-
-It's unglamorous but it matters.
-
-The big takeaway: most of these knobs are not independent. delivery.timeout.ms only makes sense relative to request.timeout.ms. Linger interacts with delivery timeout. Buffer size is meaningless without knowing your throughput. Tune them as a set, not one at a time.
-
+ 
