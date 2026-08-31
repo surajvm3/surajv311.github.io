@@ -63,48 +63,17 @@ Now, I have been working on testing MM2 (GCP managed not opensource). Multiple m
 - On MM2 restart: MM2 reads its last committed offset from the source cluster (stored in the MM2 consumer group). It resumes from where it left off. Data is not lost if it was within rentention window of source kafka. 
 - When a new tenant kafka is added, we can add a new MM2 instance in the cluster (cluster doesn't restart). Topic patterns are matched based on config, and they sync.
 - Partition count scenarios:
-- 
-## The Partition Count Trap
+  - Case 1: Tenant has FEWER partitions than Central: MM2 replicates messages from partitions 0–3 of the source. Partitions 4–7 on central will not receive any data from this tenant. They sit empty. If another tenant (Tenant B) also has `orders` with 4 partitions, its MM2 instance will also only write to partitions 0–3 — mixing data from both tenants in those 4 partitions while 4–7 remain empty. Messages are not lost, just unevenly distributed.
+    ```
+    Tenant A: orders (4 partitions)
+    Central:  orders (8 partitions)
+    ```
+    
+  - Case 2: Tenant has MORE partitions than Central: Modulo maps (partition 5 → partition 5 % 4 = 1), meaning multiple source partitions collapse into fewer target partitions
+    ```
+    Tenant A: orders (8 partitions)
+    Central:   orders (4 partitions)
+    ```
 
-This is one of the most important — and least documented — gotchas with identity replication.
+------------------------------
 
-### Case 1: Tenant has FEWER partitions than Central
-
-```
-Tenant A: orders (4 partitions)
-Central:   orders (8 partitions)
-```
-
-**What happens:** MM2 replicates messages from partitions 0–3 of the source. Partitions 4–7 on central will **never receive any data** from this tenant. They sit empty.
-
-If another tenant (Tenant B) also has `orders` with 4 partitions, its MM2 instance will also only write to partitions 0–3 — mixing data from both tenants in those 4 partitions while 4–7 remain empty.
-
-**This is a waste of partitions, not a data loss scenario.** Messages are not lost, just unevenly distributed.
-
-### Case 2: Tenant has MORE partitions than Central ⚠️ DATA LOSS
-
-```
-Tenant A: orders (8 partitions)
-Central:   orders (4 partitions)
-```
-
-**What happens:** MM2 uses a partition mapping function. With identity replication, it maps source partition N to target partition N. But if N >= 4 (target partition count), MM2 either:
-- **Modulo maps** (partition 5 → partition 5 % 4 = 1), meaning multiple source partitions collapse into fewer target partitions — **ordering within a key may be violated**
-- **Drops messages from out-of-range partitions** depending on MM2 version and configuration
-
-In practice, **data loss or ordering violations** occur when the source has more partitions than the target. This is the dangerous scenario.
-
-**Rule of thumb:** Always set `central Kafka topic partitions >= max(tenant topic partitions across all tenants)`.
-
-### Safe Configuration Strategy
-
-| Tenant | Topic | Partitions |
-|---|---|---|
-| Tenant A | orders | 4 |
-| Tenant B | orders | 8 |
-| Tenant C | orders | 12 |
-| **Central** | **orders** | **≥ 12** |
-
-When in doubt, pre-provision central Kafka topics with higher partition counts. You can always increase partitions later, but you cannot decrease them.
-
---- 
