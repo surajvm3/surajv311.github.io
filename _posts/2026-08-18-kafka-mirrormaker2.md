@@ -69,11 +69,13 @@ Now, I have been working on testing MM2 (GCP managed not opensource). Multiple m
     Central:  orders (8 partitions)
     ```
     
-  - Case 2: Tenant has MORE partitions than Central: Modulo maps (partition 5 → partition 5 % 4 = 1), meaning multiple source partitions collapse into fewer target partitions
+  - Case 2: Tenant has MORE partitions than Central: M2 maintains a strict 1:1 partition mapping. Considering below tenant(8)/central(4) topic partitions example. MM2 will attempt to automatically increase the Central topic's partition count to 8 (if sync.topic.configs.enabled=true). If it lacks permissions to alter the topic, the connector task will crash when it attempts to write a record to a non-existent partition (e.g., partition 5, but for remaining partitions the syncing it will work as usual). Not that this can cause data skew in already existing partitions (i.e partition 1-4) due to other tenants incoming data, hence it has to be kept in mind. 
     ```
     Tenant A: orders (8 partitions)
     Central:   orders (4 partitions)
     ```
+
+    - From what I've read so far, assume this case: `orders` topic in tenant A kafka is bulky so we partition it to say 10. `orders` topic in tenant B kafka is light and we partition it to 2. In central kafka, the `order` topic, since it will have mix of messages from both tenants if I say initially created topic with 5 partitions. Now if I want my kafka-connect mirrormaker2 to basically sync messages across tenants from the topic into these 5 partitions probably using hash partitioning or something, then it is NOT possible. It will try to increase the central kafka topic partitions to 10 and sync, else won't sync. We have to understand that MM2 is a replication tool, not repartitioning tool. 
 
 ------------------------------
 
